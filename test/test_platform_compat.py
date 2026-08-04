@@ -469,6 +469,54 @@ class TestFileLockContention:
             os.close(fd_shared)
             os.close(fd_other)
 
+    @pytest.mark.skipif(not pc.IS_WINDOWS, reason="Windows LK_LOCK ceiling regression")
+    def test_windows_blocking_acquire_waits_past_lk_lock_ceiling(self, tmp_path):
+        # Regression for issue #470: msvcrt's LK_LOCK "blocking" code gives up
+        # after ~10s with EDEADLOCK and the old shim treated that as "acquired".
+        # A holder that keeps the lock LONGER than that ceiling must make a
+        # blocking contender WAIT (until release or its own timeout) — never
+        # fall through and enter the critical section unserialized at ~10s.
+        #
+        # Drive _win_acquire_blocking directly with an EXPLICIT timeout past the
+        # ceiling: the module default is a short on-loop-safety ceiling, but the
+        # bug being pinned is specifically the ~10s LK_LOCK give-up point.
+        import threading
+
+        lock = tmp_path / ".ceiling.lock"
+        hold_secs = 13.0
+        fd_holder = os.open(str(lock), os.O_RDWR | os.O_CREAT, 0o600)
+        fd_contender = os.open(str(lock), os.O_RDWR | os.O_CREAT, 0o600)
+        released_at = {"t": 0.0}
+        entered_at = {"t": 0.0}
+        holder_ready = threading.Event()
+
+        def _hold():
+            with pc.file_lock(fd_holder, exclusive=True, required=True):
+                holder_ready.set()
+                time.sleep(hold_secs)
+                released_at["t"] = time.monotonic()
+
+        holder = threading.Thread(target=_hold)
+        holder.start()
+        try:
+            assert holder_ready.wait(timeout=10.0), "holder never took the lock"
+            # Blocking acquire on the OTHER fd with a timeout past the ~10s
+            # ceiling: it must not succeed until the holder releases at ~13s.
+            got = pc._win_acquire_blocking(fd_contender, timeout=30.0)
+            entered_at["t"] = time.monotonic()
+            assert got is True, "contender never acquired the lock after release"
+            # It entered only AFTER the holder released — proving it waited past
+            # the 10s ceiling that used to let it slip through early.
+            assert entered_at["t"] >= released_at["t"], (
+                "contender entered the critical section before the holder "
+                "released — the blocking acquire fell through the LK_LOCK ceiling"
+            )
+            pc.release_lock(fd_contender)
+        finally:
+            holder.join(timeout=20.0)
+            os.close(fd_holder)
+            os.close(fd_contender)
+
 
 class TestProcessIdentityPosix:
     def test_get_ppid_of_self_is_positive_on_posix(self):

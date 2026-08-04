@@ -145,6 +145,41 @@ security-warning handlers in each caller fire — a naive `if IS_POSIX: os.chmod
 guard would silently no-op on Windows, leaving secrets group/world-readable
 under NTFS.
 
+## File locking on Windows
+
+`platform_compat.file_lock` / `acquire_lock` provide a genuine *blocking*
+acquire on Windows, not a best-effort one. The catch is that `msvcrt.locking`'s
+own "blocking" codes (`LK_LOCK` / `LK_RLCK`) are **not** the equivalent of
+POSIX `fcntl.flock(LOCK_EX)`: they retry ~10 times at 1-second intervals and
+then raise `EDEADLOCK`, so a naive wrapper would silently give up after ~10s
+and run its read-modify-write with no exclusion — losing writes (this was the
+root cause of the concurrent-memory-append data loss). The shim instead spins
+on the non-blocking code (`LK_NBLCK`) up to `_WIN_LOCK_TIMEOUT_SECS`. That
+ceiling is deliberately modest (a safety bound against a stuck holder, not a
+normal wait — every in-tree critical section is a sub-second read + atomic
+rename) because a few callers still take the lock on the asyncio loop thread.
+If the lock still cannot be taken, `required=True` raises and the default path
+logs a warning — the failure is never silent. Non-blocking `try_acquire_lock`
+already used `LK_NBLCK` and is unchanged.
+
+## Directory links on Windows
+
+`os.symlink` needs `SeCreateSymbolicLinkPrivilege`, which an ordinary
+(non-elevated, non-Developer-Mode) Windows account does NOT hold, so it raises
+`OSError [WinError 1314]`. Every feature that links a *directory* into place
+therefore routes through `platform_compat.symlink_or_junction`, which falls
+back to a directory **junction** — a reparse point that needs no privilege and
+is followed transparently by reads and by `resolve()`/`realpath` (so
+containment/escape checks still hold). Affected paths: app skill registration
+(`apps/bridges.py`), boot-time skill reconcile, and the dev-mode frontend dist
+link (`frontend.ensure_dev_dist_symlink`). Because a junction is not reported by
+`os.path.islink`/`Path.is_symlink`, code that must *detect or remove* such a
+link uses `platform_compat.is_link_or_junction` / `unlink_link_or_junction` —
+notably the md-notebook `.trash` guard, whose refusal would otherwise be
+POSIX-only and let a Windows junction redirect a trashed note out of the vault.
+A *file* symlink has no junction equivalent, so the few tests that plant one
+stay Windows-skipped in `test/windows-expected-failures.txt`.
+
 ## Troubleshooting
 
 - **`ModuleNotFoundError: No module named 'fcntl'`** — you installed a

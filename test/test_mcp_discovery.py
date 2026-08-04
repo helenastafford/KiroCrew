@@ -1952,6 +1952,43 @@ class TestProbeServerStderrCapture:
         # The literal secret must not appear verbatim in the error field.
         assert "AKIAIOSFODNN7EXAMPLEXXX" not in (result.error or "")
 
+    @pytest.mark.asyncio
+    async def test_long_probe_error_keeps_remedy_sentence(self, monkeypatch) -> None:
+        """A long spawn exception must not be chopped mid-sentence.
+
+        SandboxUnavailableError ends with the remedy naming
+        agent.sandbox_allow_unsandboxed_exec; the old 200-char cap discarded
+        it, so a Windows user saw '...Probe detail: not Linux. I' and no fix.
+        """
+        from kiro_crew.mcp_discovery import _PROBE_ERROR_MAX_CHARS, probe_server
+
+        long_msg = (
+            "Sandbox backend unavailable and allow_unsandboxed_exec is not set. "
+            "Probe detail: not Linux. "
+            + ("x" * 300)
+            + " set agent.sandbox_allow_unsandboxed_exec=true in ~/.kiro/crew/config.json"
+        )
+        assert len(long_msg) > 200  # the old cap would have chopped this
+
+        server = McpServerInfo(name="srv", command="srv")
+
+        # Resolve the command, then fail at the sandbox chokepoint with the long
+        # message — the real path a Windows host takes with no sandbox backend.
+        monkeypatch.setattr(
+            "kiro_crew.mcp_discovery.shutil.which", lambda *a, **k: "/usr/bin/srv"
+        )
+
+        def boom(*_a: object, **_k: object) -> object:
+            raise RuntimeError(long_msg)
+
+        monkeypatch.setattr("kiro_crew.mcp_discovery.sandboxed_spawn_argv", boom)
+        result = await probe_server(server)
+
+        assert result.status == "error"
+        # The remedy sentence at the tail survives.
+        assert "sandbox_allow_unsandboxed_exec=true" in (result.error or "")
+        assert len(result.error or "") <= _PROBE_ERROR_MAX_CHARS
+
 
 class TestProbeStdioMalformedResponse:
     """Stdio probe must not crash on non-spec JSON-RPC response shapes.
