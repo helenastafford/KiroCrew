@@ -1285,6 +1285,130 @@ class TestProbeRemote:
         assert result.status == "error"
 
 
+class TestProbeServerConsentGate:
+    """``probe_server`` itself refuses a consent-disabled server.
+
+    Probing is what RUNS the server, so the refusal has to live in the function
+    every entry point funnels through — not in each caller's pre-filter, which
+    only holds until a new call site forgets it.
+    """
+
+    def setup_method(self) -> None:
+        _probe_cache.clear()
+
+    def teardown_method(self) -> None:
+        _probe_cache.clear()
+
+    @pytest.mark.asyncio
+    async def test_disabled_stdio_server_is_never_spawned(self) -> None:
+        """No subprocess for a disabled stdio server, even with a resolvable command.
+
+        ``shutil.which`` is stubbed so the probe cannot bail out early on
+        "command not found" — that would make this test pass for the wrong
+        reason, without ever proving the consent check ran.
+        """
+        server = McpServerInfo(name="held", command="true", disabled=True)
+
+        with (
+            patch("kiro_crew.mcp_discovery.shutil.which", return_value="/bin/true"),
+            patch(
+                "kiro_crew.mcp_discovery.create_subprocess_limited",
+                new_callable=AsyncMock,
+            ) as mock_spawn,
+        ):
+            result = await probe_server(server)
+
+        mock_spawn.assert_not_awaited()
+        assert result.status == "disabled"
+        assert result.error == ""
+
+    @pytest.mark.asyncio
+    async def test_disabled_remote_server_is_never_connected(self) -> None:
+        """A disabled remote server opens no connection.
+
+        The refusal sits ahead of the local/remote dispatch: probing a remote
+        server reaches out over the network, which is equally not-consented.
+        """
+        server = McpServerInfo(name="held-remote", url="https://example.com/mcp", disabled=True)
+
+        with patch("kiro_crew.mcp_discovery._probe_remote", new_callable=AsyncMock) as mock_remote:
+            result = await probe_server(server)
+
+        mock_remote.assert_not_awaited()
+        assert result.status == "disabled"
+
+    @pytest.mark.asyncio
+    async def test_truthy_non_bool_disabled_still_withholds_spawn(self) -> None:
+        """A non-bool ``disabled`` fails CLOSED.
+
+        ``McpServerInfo`` is hand-built by callers (``cli_doctor`` does exactly
+        that) and the flag can originate in unvalidated config JSON, so the
+        check is truthiness rather than ``is True``.
+        """
+        server = McpServerInfo(name="held-str", command="true")
+        server.disabled = "yes"  # type: ignore[assignment]
+
+        with (
+            patch("kiro_crew.mcp_discovery.shutil.which", return_value="/bin/true"),
+            patch(
+                "kiro_crew.mcp_discovery.create_subprocess_limited",
+                new_callable=AsyncMock,
+            ) as mock_spawn,
+        ):
+            result = await probe_server(server)
+
+        mock_spawn.assert_not_awaited()
+        assert result.status == "disabled"
+
+    @pytest.mark.asyncio
+    async def test_refusal_does_not_clobber_cached_tools(self) -> None:
+        """The refusal must not write to the shared probe cache.
+
+        Guards a specific future refactor rather than the missing guard: adding
+        a well-meaning ``_cache_probe(server)`` to the refusal path to "record
+        the disabled state". The cache is keyed by name and read by
+        ``GET /api/mcp`` through ``_get_cached``, so an empty "disabled" entry
+        would erase the tool list a real probe recorded before the user
+        disabled the server. Verified by adding that call and watching this
+        fail — it does NOT fail merely from removing the guard, because the
+        probe's early error returns skip ``_cache_probe`` anyway.
+        """
+        probed = McpServerInfo(
+            name="was-ok", command="true", status="ok", tools=["alpha", "beta"]
+        )
+        _cache_probe(probed)
+
+        disabled = McpServerInfo(name="was-ok", command="true", disabled=True)
+        with patch("kiro_crew.mcp_discovery.shutil.which", return_value="/bin/true"):
+            await probe_server(disabled)
+
+        status, tools, _ = _get_cached("was-ok")
+        assert status == "ok"
+        assert tools == ["alpha", "beta"]
+
+    @pytest.mark.asyncio
+    async def test_refusal_preserves_last_known_tools_and_clears_stale_error(self) -> None:
+        """``tools`` survives the refusal; a stale probe ``error`` does not.
+
+        ``list_servers`` merges cached status/tools/error onto every row, so a
+        disabled row can arrive carrying both — and a leftover failure message
+        is not the reason this call returned.
+        """
+        server = McpServerInfo(
+            name="held-with-history",
+            command="true",
+            tools=["alpha"],
+            error="timeout",
+            disabled=True,
+        )
+
+        result = await probe_server(server)
+
+        assert result.status == "disabled"
+        assert result.tools == ["alpha"]
+        assert result.error == ""
+
+
 class TestProbeServerProcessCleanup:
     """Tests for the finally block that tears down the probed subprocess."""
 
