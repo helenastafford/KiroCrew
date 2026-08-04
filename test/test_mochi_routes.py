@@ -1207,3 +1207,187 @@ class TestQueueFilenameHasOneDefinition:
             if py.name != owner and literal in py.read_text(encoding="utf-8")
         ]
         assert offenders == [], f"{offenders} redefine the queue filename instead of importing it"
+
+
+class TestMcpToolsRoute:
+    """GET /api/apps/mochi/mcp-tools/{name} — the settings panel's discover action.
+
+    The panel used to call core's ``/api/mcp/servers/{name}``, which only has
+    PUT/DELETE registered, so every discover took a 405 and both the api helper
+    and the click handler swallowed it.
+    """
+
+    @staticmethod
+    def _server(name="srv", disabled=False, tools=()):
+        from kiro_crew.mcp_discovery import McpServerInfo
+
+        s = McpServerInfo(name=name, command="node")
+        s.tools = list(tools)
+        s.disabled = disabled
+        return s
+
+    def _patch(self, monkeypatch, servers, probe=None):
+        # Patch the names bound INTO routes, not mcp_discovery's own attributes:
+        # routes imports them at module scope, so rebinding the source module
+        # would leave these handlers holding the real functions and the test
+        # would silently exercise a live probe.
+        from kiro_crew.apps.builtins.mochi.backend import routes as r
+
+        monkeypatch.setattr(r, "list_servers", lambda: list(servers))
+        if probe is not None:
+            monkeypatch.setattr(r, "probe_server", probe)
+
+    @pytest.mark.asyncio
+    async def test_route_is_registered_for_get(self):
+        """Guards the actual defect: the path existed but not for this method."""
+        from aiohttp import web
+
+        from kiro_crew.apps.builtins.mochi.backend import routes
+
+        app = web.Application()
+        routes.register_routes(app)
+        registered = {
+            (res.method, str(res.resource.canonical))
+            for res in app.router.routes()
+            if res.resource is not None
+        }
+        assert ("POST", "/api/apps/mochi/mcp-tools/{name}") in registered
+
+    @pytest.mark.asyncio
+    async def test_returns_tools_as_objects(self, monkeypatch):
+        from kiro_crew.apps.builtins.mochi.backend import routes
+
+        srv = self._server(tools=["alpha", "beta"])
+
+        async def _probe(server):
+            server.status = "ok"
+            return server
+
+        self._patch(monkeypatch, [srv], _probe)
+        req = make_mocked_request("POST", "/api/apps/mochi/mcp-tools/srv", match_info={"name": "srv"})
+        resp = await routes._handle_mcp_tools_probe(req)
+        assert resp.status == 200
+        body = json.loads(resp.text)
+        assert body["tools"] == [{"name": "alpha"}, {"name": "beta"}]
+        assert body["cached"] is False
+
+    @pytest.mark.asyncio
+    async def test_non_string_tool_names_are_dropped(self, monkeypatch):
+        """A server answering a non-string ``name`` must not reach the panel.
+
+        Both extraction paths in ``mcp_discovery`` bind the name on truthiness
+        alone (``isinstance(t, dict) and (name := t.get("name", ""))``), so a
+        server returning ``{"name": {"x": 1}}`` puts a dict in ``server.tools``.
+        The panel renders each name as a React child and a non-primitive child
+        throws, blanking the settings tree — so this boundary narrows the shape
+        instead of trusting upstream.
+        """
+        from kiro_crew.apps.builtins.mochi.backend import routes
+
+        srv = self._server(tools=[{"x": 1}, "alpha", ["a"], "", 7, None, "beta"])
+
+        async def _probe(server):
+            server.status = "ok"
+            return server
+
+        self._patch(monkeypatch, [srv], _probe)
+        req = make_mocked_request("POST", "/api/apps/mochi/mcp-tools/srv", match_info={"name": "srv"})
+        resp = await routes._handle_mcp_tools_probe(req)
+        assert resp.status == 200
+        body = json.loads(resp.text)
+        assert body["tools"] == [{"name": "alpha"}, {"name": "beta"}]
+        for entry in body["tools"]:
+            assert isinstance(entry["name"], str) and entry["name"]
+
+    @pytest.mark.asyncio
+    async def test_probe_error_prose_is_not_returned(self, monkeypatch):
+        """A server's own error text can carry a credential and this response
+        reaches the dashboard, so the prose must not be on the wire at all."""
+        from kiro_crew.apps.builtins.mochi.backend import routes
+
+        srv = self._server()
+
+        async def _probe(server):
+            server.status = "error"
+            server.error = "connect failed: https://example.test?token=SECRETVALUE"
+            return server
+
+        self._patch(monkeypatch, [srv], _probe)
+        req = make_mocked_request("POST", "/api/apps/mochi/mcp-tools/srv", match_info={"name": "srv"})
+        resp = await routes._handle_mcp_tools_probe(req)
+        assert resp.status == 200
+        assert "SECRETVALUE" not in resp.text
+        body = json.loads(resp.text)
+        assert "error" not in body, "error prose must not be returned"
+        assert body["status"] == "error", "status is how the panel learns the probe failed"
+
+    @pytest.mark.asyncio
+    async def test_unknown_server_is_404(self, monkeypatch):
+        from kiro_crew.apps.builtins.mochi.backend import routes
+
+        self._patch(monkeypatch, [self._server(name="other")])
+        req = make_mocked_request("POST", "/api/apps/mochi/mcp-tools/srv", match_info={"name": "srv"})
+        resp = await routes._handle_mcp_tools_probe(req)
+        assert resp.status == 404
+
+    @pytest.mark.asyncio
+    async def test_disabled_server_is_never_probed(self, monkeypatch):
+        """Probing SPAWNS the server. ``probe_all`` filters consent-disabled rows
+        before calling ``probe_server``; ``probe_server`` does not enforce it, so
+        this per-server entry point must, or it bypasses the consent gate."""
+        from kiro_crew.apps.builtins.mochi.backend import routes
+
+        called = []
+
+        async def _probe(server):
+            called.append(server.name)
+            return server
+
+        self._patch(monkeypatch, [self._server(disabled=True)], _probe)
+        req = make_mocked_request("POST", "/api/apps/mochi/mcp-tools/srv", match_info={"name": "srv"})
+        resp = await routes._handle_mcp_tools_probe(req)
+        assert resp.status == 409
+        assert json.loads(resp.text)["code"] == "server_disabled"
+        assert called == [], "a disabled server must not be spawned"
+
+    @pytest.mark.asyncio
+    async def test_blank_name_is_400(self, monkeypatch):
+        from kiro_crew.apps.builtins.mochi.backend import routes
+
+        self._patch(monkeypatch, [])
+        req = make_mocked_request("POST", "/api/apps/mochi/mcp-tools/ ", match_info={"name": "  "})
+        resp = await routes._handle_mcp_tools_probe(req)
+        assert resp.status == 400
+
+    @pytest.mark.asyncio
+    async def test_concurrent_probe_is_rejected(self, monkeypatch):
+        """Click-spam must not spawn one process per click."""
+        from kiro_crew.apps.builtins.mochi.backend import routes
+
+        async def _probe(server):
+            return server
+
+        self._patch(monkeypatch, [self._server()], _probe)
+        routes._mcp_probe_inflight.add("srv")
+        try:
+            req = make_mocked_request(
+                "POST", "/api/apps/mochi/mcp-tools/srv", match_info={"name": "srv"}
+            )
+            resp = await routes._handle_mcp_tools_probe(req)
+        finally:
+            routes._mcp_probe_inflight.discard("srv")
+        assert resp.status == 409
+        assert json.loads(resp.text)["code"] == "probe_in_progress"
+
+    @pytest.mark.asyncio
+    async def test_inflight_cleared_when_probe_raises(self, monkeypatch):
+        from kiro_crew.apps.builtins.mochi.backend import routes
+
+        async def _probe(server):
+            raise RuntimeError("boom")
+
+        self._patch(monkeypatch, [self._server()], _probe)
+        req = make_mocked_request("POST", "/api/apps/mochi/mcp-tools/srv", match_info={"name": "srv"})
+        with pytest.raises(RuntimeError):
+            await routes._handle_mcp_tools_probe(req)
+        assert "srv" not in routes._mcp_probe_inflight
