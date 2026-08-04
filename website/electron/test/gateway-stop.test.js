@@ -81,6 +81,30 @@ test("postShutdown returns false when no secret file exists", async () => {
   fs.rmSync(home, { recursive: true, force: true });
 });
 
+test("postShutdown tries each candidate secret — a stale first secret does not block the live one", async () => {
+  // Migration edge: a partially-copied canonical secret is stale, but the
+  // gateway is authenticated by the legacy one. postShutdown must POST both.
+  const { server, port } = await startServer({ secret: "live-legacy", status: 200 });
+  try {
+    const ok = await postShutdown({
+      backendUrl: `http://127.0.0.1:${port}`,
+      secrets: ["stale-canonical", "live-legacy"],
+    });
+    assert.strictEqual(ok, true);
+  } finally { server.close(); }
+});
+
+test("postShutdown returns false only after every candidate secret is rejected", async () => {
+  const { server, port } = await startServer({ secret: "the-real-one", status: 200 });
+  try {
+    const ok = await postShutdown({
+      backendUrl: `http://127.0.0.1:${port}`,
+      secrets: ["nope-1", "nope-2"],
+    });
+    assert.strictEqual(ok, false);
+  } finally { server.close(); }
+});
+
 test("stopGatewayGracefully: happy path — endpoint exits process, no signal needed", async () => {
   const home = tmpHomeWithSecret("s3cr3t");
   const proc = spawnDummy({ ignoreSigterm: true }); // proves SIGTERM was NOT used
