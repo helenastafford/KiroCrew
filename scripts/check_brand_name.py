@@ -608,22 +608,44 @@ def self_test() -> int:
     # prefix. The assertion is on the GROWTH RATIO, not a wall-clock budget: an
     # absolute threshold generous enough for a loaded CI runner is also generous
     # enough to let a quadratic implementation pass at this size.
+    # The RATIO is measured best-of-N, with base and doubled timed back to back
+    # inside each attempt. One sample at this size costs tens of milliseconds —
+    # the same order as one scheduler preemption — so on a loaded runner (this
+    # self-test also runs under a 16-worker xdist suite) a single measurement
+    # swung to 3.1x against a LINEAR implementation. Timing each size best-of-N
+    # separately is not enough: an unlucky `doubled` still divides a lucky
+    # `base`. Pairing them per attempt and keeping the smallest ratio is the
+    # robust form, and it cannot mask a regression, because noise only ever
+    # makes a sample SLOWER: a genuinely quadratic scan cannot produce a low
+    # ratio no matter how many attempts it gets.
+    # 2.5 sits between the two populations rather than on top of one. Measured on
+    # this input: honest linear reports 1.7-1.9x even with the CPU contended,
+    # while a per-match prefix rescan (the regression this guards) reports 3.0x+.
+    # The old 3.0 bound was ON the quadratic measurement, so the mutant escaped.
+    _MAX_RATIO = 2.5
+    _RATIO_ATTEMPTS = 5
+
     def timed(count: int) -> tuple[float, int]:
         line = "!KiroCrew" * count
         began = time.monotonic()
         found = len(list(scan_line("big.md", 1, line, in_code=False)))
         return time.monotonic() - began, found
 
-    base_time, base_found = timed(20_000)
-    doubled_time, doubled_found = timed(40_000)
-    ratio = doubled_time / base_time if base_time > 0 else 0.0
+    ratio = float("inf")
+    base_time = doubled_time = 0.0
+    base_found = doubled_found = 0
+    for _ in range(_RATIO_ATTEMPTS):
+        base_time, base_found = timed(20_000)
+        doubled_time, doubled_found = timed(40_000)
+        if base_time > 0:
+            ratio = min(ratio, doubled_time / base_time)
     if (base_found, doubled_found) != (20_000, 40_000):
         print(f"  FAIL repeated-brands: found {base_found}/{doubled_found}, want 20000/40000")
         failures += 1
-    elif ratio > 3.0:
+    elif ratio > _MAX_RATIO:
         print(f"  FAIL repeated-brands: doubling the input cost {ratio:.1f}x "
-              f"({base_time:.3f}s -> {doubled_time:.3f}s); linear is ~2x, so a "
-              f"per-match scan of the line has come back")
+              f"(best of {_RATIO_ATTEMPTS} paired attempts, limit {_MAX_RATIO}x); "
+              f"linear is ~2x, so a per-match scan of the line has come back")
         failures += 1
     else:
         print(f"  ok   repeated-brands (doubling cost {ratio:.1f}x, linear)")

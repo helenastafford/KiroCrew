@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import tempfile
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -218,6 +219,49 @@ def _make_executable(path: str) -> None:
     with open(path, "wb") as f:
         f.write(b"#!/bin/sh\n")
     os.chmod(path, 0o755)
+
+
+# _synthesize_polly() short-circuits to None when the `aws` CLI is absent, so any
+# test that exercises the argv build or the subprocess lifecycle must state that
+# the CLI is present. It is NOT present on a stock Windows box (nor on a minimal
+# Linux CI image), so relying on the ambient host makes those tests silently
+# host-dependent rather than deterministic.
+_FAKE_AWS_CLI = "aws.exe" if os.name == "nt" else "/usr/bin/aws"
+
+
+# Stands in for the remedy prose sandbox.wrap_argv builds for kind="no_backend".
+# The handlers under test must RELAY this string, not compose their own copy —
+# only this kind names the opt-in, so a hardcoded remedy would be wrong for the
+# "transient" and "foreign_sandbox" kinds.
+_SANDBOX_REMEDY = (
+    "No OS-level sandbox backend is available on this host. If this host "
+    "genuinely lacks a sandbox backend, set "
+    "agent.sandbox_allow_unsandboxed_exec=true in ~/.kiro/crew/config.json."
+)
+
+
+def _patch_aws_on_path(monkeypatch) -> None:
+    """Make ``shutil.which`` report the ``aws`` CLI present, others absent."""
+    monkeypatch.setattr(
+        "kiro_crew.voice_reply.shutil.which",
+        lambda name, *a, **k: _FAKE_AWS_CLI if name == "aws" else None,
+    )
+
+
+@pytest.fixture(autouse=True)
+def _no_cgroup_scope(monkeypatch):
+    """Neutralize ``cgroup_scope_argv`` for every test in this module.
+
+    Both synthesis paths call it immediately after ``wrap_argv``, and on a
+    cgroup-v2 host it PREPENDS a launcher to the argv. Tests here mock
+    ``create_subprocess_exec`` and assert on the command that reaches it, so an
+    un-neutralized cgroup wrap makes them host-dependent: green wherever no
+    controller is delegated, red on a Linux runner that has one. Applied
+    module-wide rather than per-test so a new test cannot silently inherit the
+    same host dependence. Tests that specifically exercise cgroup scoping should
+    patch it back to the real function.
+    """
+    monkeypatch.setattr("kiro_crew.voice_reply.cgroup_scope_argv", lambda argv: list(argv))
 
 
 # ── Provider constants ──────────────────────────────────────────────────
@@ -545,6 +589,52 @@ class TestSynthesizePiper:
             assert await _synthesize_piper("hello", piper_model=str(model)) is None
 
     @pytest.mark.asyncio
+    async def test_sandbox_unavailable_returns_none_and_unlinks(
+        self, tmp_path, monkeypatch, caplog,
+    ) -> None:
+        """A fail-closed sandbox is reported with its remedy, not as a generic error.
+
+        Mirrors the Polly counterpart: no OS sandbox backend (every Windows host,
+        Linux without user namespaces) makes wrap_argv raise, and piper must
+        degrade to None, unlink the temp WAV, and relay the sandbox layer's own
+        remedy prose rather than logging a stack trace that reads as a
+        binary/model fault.
+        """
+        from kiro_crew.sandbox import SandboxUnavailableError
+
+        bin_path = tmp_path / "piper"
+        _make_executable(str(bin_path))
+        model = tmp_path / "voice.onnx"
+        model.write_bytes(b"m")
+
+        created: list[str] = []
+        real_mkstemp = tempfile.mkstemp
+
+        def tracking_mkstemp(*a, **k):
+            fd, p = real_mkstemp(*a, **k)
+            created.append(p)
+            return fd, p
+
+        monkeypatch.setattr("kiro_crew.voice_reply.tempfile.mkstemp", tracking_mkstemp)
+
+        def refuse(cmd, mode):
+            raise SandboxUnavailableError(_SANDBOX_REMEDY, "no_backend", "not Linux")
+
+        monkeypatch.setattr("kiro_crew.voice_reply.wrap_argv", refuse)
+        monkeypatch.setattr(
+            "kiro_crew.voice_reply._resolve_piper_binary", lambda *a, **k: str(bin_path)
+        )
+
+        with caplog.at_level("ERROR", logger="kiro_crew.voice_reply"):
+            assert await _synthesize_piper("hello", piper_model=str(model)) is None
+
+        assert created, "piper should have allocated a temp wav"
+        assert not os.path.exists(created[0]), "temp wav must be unlinked"
+        assert _SANDBOX_REMEDY in caplog.text
+        assert "no_backend" in caplog.text
+        assert "piper synthesis error" not in caplog.text
+
+    @pytest.mark.asyncio
     async def test_sandbox_cleanup_unlinked(self, tmp_path) -> None:
         """If wrap_argv returns a cleanup path, it must be unlinked after exit."""
         bin_path = tmp_path / "piper"
@@ -584,11 +674,14 @@ class TestSynthesizePolly:
     @pytest.fixture(autouse=True)
     def _passthrough_sandbox(self, monkeypatch):
         # _synthesize_polly() calls wrap_argv before create_subprocess_exec.
-        # On macOS 26 wrap_argv raises, which is caught and returns None.
-        # Patch to passthrough so the existing create_subprocess_exec mocks run.
+        # wrap_argv fail-closes on any host with no OS sandbox backend (macOS 26,
+        # every Windows host), which is caught and returns None. Patch to
+        # passthrough so the existing create_subprocess_exec mocks run.
         monkeypatch.setattr(
             "kiro_crew.voice_reply.wrap_argv", lambda argv, **k: (list(argv), None)
         )
+        # cgroup_scope_argv is neutralized module-wide by _no_cgroup_scope.
+        _patch_aws_on_path(monkeypatch)
 
     @pytest.mark.asyncio
     async def test_invalid_engine_falls_back_to_default(self, tmp_path) -> None:
@@ -745,6 +838,96 @@ class TestSynthesizePolly:
         assert result is not None
         os.unlink(result)
         assert not cleanup_path.exists(), "polly sandbox cleanup file should be removed"
+
+    @pytest.mark.asyncio
+    async def test_aws_cli_missing_short_circuits_before_spawn(self, monkeypatch) -> None:
+        """Absent ``aws`` CLI degrades to None without attempting a spawn.
+
+        The guard must run BEFORE create_subprocess_exec: reaching the spawn
+        would raise FileNotFoundError instead of degrading gracefully.
+        """
+        monkeypatch.setattr(
+            "kiro_crew.voice_reply.shutil.which", lambda name, *a, **k: None
+        )
+        spawned = {"n": 0}
+
+        async def fake_exec(*cmd, **kwargs):
+            spawned["n"] += 1
+            raise AssertionError("must not spawn when the aws CLI is absent")
+
+        with patch("asyncio.create_subprocess_exec", side_effect=fake_exec):
+            assert await _synthesize_polly("<speak>hi</speak>") is None
+        assert spawned["n"] == 0
+
+    @pytest.mark.asyncio
+    async def test_sandbox_unavailable_returns_none_and_unlinks(
+        self, monkeypatch, caplog,
+    ) -> None:
+        """A fail-closed sandbox is reported with its remedy, not as a generic error.
+
+        Every Windows host (and Linux without user namespaces) has no OS sandbox
+        backend, so wrap_argv raises SandboxUnavailableError. Polly must degrade to
+        None, unlink the temp MP3, and relay the sandbox layer's remedy prose — the
+        generic handler's "Polly synthesis error" stack trace misattributes this to
+        Polly or AWS credentials.
+        """
+        from kiro_crew.sandbox import SandboxUnavailableError
+
+        created: list[str] = []
+        real_mkstemp = tempfile.mkstemp
+
+        def tracking_mkstemp(*a, **k):
+            fd, p = real_mkstemp(*a, **k)
+            created.append(p)
+            return fd, p
+
+        monkeypatch.setattr("kiro_crew.voice_reply.tempfile.mkstemp", tracking_mkstemp)
+
+        def refuse(cmd, mode):
+            raise SandboxUnavailableError(_SANDBOX_REMEDY, "no_backend", "not Linux")
+
+        monkeypatch.setattr("kiro_crew.voice_reply.wrap_argv", refuse)
+
+        with caplog.at_level("ERROR", logger="kiro_crew.voice_reply"):
+            assert await _synthesize_polly("<speak>hi</speak>") is None
+
+        assert created, "polly should have allocated a temp mp3"
+        assert not os.path.exists(created[0]), "temp mp3 must be unlinked"
+        assert _SANDBOX_REMEDY in caplog.text
+        assert "no_backend" in caplog.text
+        assert "Polly synthesis error" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_transient_sandbox_refusal_does_not_advise_disabling(
+        self, monkeypatch, caplog,
+    ) -> None:
+        """A ``transient`` refusal must relay retry advice, not the opt-in key.
+
+        SandboxUnavailableError.kind is the contract: for ``"transient"`` the
+        sandbox layer's own prose says retry and explicitly says callers must NOT
+        advise disabling the sandbox. Hardcoding the
+        ``sandbox_allow_unsandboxed_exec`` remedy in this handler would tell an
+        operator to permanently drop isolation to work around momentary resource
+        pressure, so the handler must relay ``str(exc)`` rather than its own copy.
+        """
+        from kiro_crew.sandbox import SandboxUnavailableError
+
+        transient_prose = (
+            "This probe failure looks TRANSIENT (momentary resource pressure) "
+            "— it is not cached. Do NOT disable the sandbox for this; retry."
+        )
+
+        def refuse(cmd, mode):
+            raise SandboxUnavailableError(transient_prose, "transient", "fork: EAGAIN")
+
+        monkeypatch.setattr("kiro_crew.voice_reply.wrap_argv", refuse)
+
+        with caplog.at_level("ERROR", logger="kiro_crew.voice_reply"):
+            assert await _synthesize_polly("<speak>hi</speak>") is None
+
+        assert transient_prose in caplog.text
+        assert "transient" in caplog.text
+        assert "sandbox_allow_unsandboxed_exec" not in caplog.text
 
 
 # ── synthesize_speech() dispatcher ───────────────────────────────────────
@@ -977,6 +1160,7 @@ class TestTextTypeAutoDetection:
         monkeypatch.setattr(
             "kiro_crew.voice_reply.wrap_argv", lambda argv, **k: (list(argv), None)
         )
+        _patch_aws_on_path(monkeypatch)
 
     @pytest.mark.asyncio
     async def test_ssml_input_uses_ssml_text_type(self, tmp_path) -> None:
