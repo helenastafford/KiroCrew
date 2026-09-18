@@ -163,6 +163,13 @@ _CANONICAL_CONSUMER_EXPR_LARGE = (
     "${{ needs.changes.outputs.linux_runner_large || 'ubuntu-latest' }}"
 )
 _EXPECTED_RESOLVER_CONSUMER_JOBS = {
+    # CodeBuild canary: shard 1 only rides the fleet resolver; the
+    # other shards stay hosted, so the expression is conditional on the
+    # matrix group rather than the canonical unconditional read.
+    (
+        "ci.yml",
+        "backend-test",
+    ): "${{ matrix.group == 1 && needs.changes.outputs.linux_runner_large || 'ubuntu-latest' }}",
     ("ci.yml", "backend-test-crew-container"): _CANONICAL_CONSUMER_EXPR,
     ("ci.yml", "coverage-combine"): _CANONICAL_CONSUMER_EXPR,
     ("ci.yml", "coverage-gate"): _CANONICAL_CONSUMER_EXPR,
